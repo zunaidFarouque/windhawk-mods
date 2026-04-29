@@ -154,6 +154,11 @@ static struct {
 
 static HWND g_hTaskbarWnd = nullptr;
 static const int kHotkeyIdBase = 0x4000;  // Safe base ID for our hotkeys
+static const DWORD kHotkeyOwnerThreadJoinTimeoutMs = 2000;
+static HANDLE g_hotkeyOwnerThread = nullptr;
+static DWORD g_hotkeyOwnerThreadId = 0;
+static HANDLE g_hotkeyOwnerReadyEvent = nullptr;
+static bool g_hotkeyOwnerReady = false;
 
 // Cross-thread IPC Messages (Anti-Deadlock)
 static UINT g_msgRegister = RegisterWindowMessage(L"Scalpel_Register");
@@ -165,6 +170,13 @@ static const UINT kKeypressRetryIntervalMs = 10;
 static std::vector<int> g_pendingKeypressKeys;
 static int g_pendingKeypressRetryCount = 0;
 static UINT_PTR g_keypressTimerId = 0;
+
+static bool DispatchHotkeyById(int hotkeyId);
+static bool RegisterOwnedHotkeysForThread();
+static void UnregisterOwnedHotkeysForThread();
+static DWORD WINAPI HotkeyOwnerThreadProc(LPVOID);
+static bool StartHotkeyOwnerThread();
+static void StopHotkeyOwnerThread();
 
 // =====================================================================
 // String & Hotkey Parsing (Lifted from m417z)
@@ -588,33 +600,148 @@ BOOL WINAPI RegisterHotKey_Hook(HWND hWnd, int id, UINT fsModifiers, UINT vk) {
 // Phase B: Taskbar Subclass & Re-Registration
 // =====================================================================
 
-void RegisterCustomHotkeys(HWND hWnd) {
-    for (size_t i = 0; i < g_settings.hotkeyActions.size(); i++) {
-        auto& action = g_settings.hotkeyActions[i];
+bool DispatchHotkeyById(int hotkeyId) {
+    for (const auto& action : g_settings.hotkeyActions) {
+        if (!action.registered || action.hotkeyId != hotkeyId)
+            continue;
+
+        if (action.actionType != HotkeyActionType::Nothing &&
+            action.actionExecutor) {
+            action.actionExecutor();
+        }
+
+        // Keep Win-key masking mitigation to suppress Start menu flicker.
+        if (action.modifiers & MOD_WIN) {
+            SendKeypressInternal({0xFF});
+        }
+        return true;
+    }
+
+    return false;
+}
+
+bool RegisterOwnedHotkeysForThread() {
+    if (!RegisterHotKey_Original) {
+        Wh_Log(L"SCALPEL: RegisterHotKey_Original unavailable.");
+        return false;
+    }
+
+    bool anyRegistered = false;
+    for (auto& action : g_settings.hotkeyActions) {
         if (action.hotkeyString.empty())
             continue;
 
-        action.hotkeyId = kHotkeyIdBase + static_cast<int>(i);
-
-        // SCALPEL BYPASS: Use original pointer to bypass our own Phase A trap
-        if (RegisterHotKey_Original(hWnd, action.hotkeyId, action.modifiers,
+        // Thread-owned global hotkey (hWnd = nullptr) dispatches WM_HOTKEY to
+        // the owner's message queue.
+        if (RegisterHotKey_Original(nullptr, action.hotkeyId, action.modifiers,
                                     action.vk)) {
             action.registered = true;
-            Wh_Log(L"SCALPEL: Re-registered custom %s (id=%d) successfully.",
+            anyRegistered = true;
+            Wh_Log(L"SCALPEL: Owner thread registered %s (id=%d).",
                    action.hotkeyString.c_str(), action.hotkeyId);
         } else {
+            action.registered = false;
+            Wh_Log(L"SCALPEL: Owner thread failed to register %s (id=%d), err=%u",
+                   action.hotkeyString.c_str(), action.hotkeyId, GetLastError());
+        }
+    }
+
+    if (!anyRegistered && !g_settings.hotkeyActions.empty()) {
+        Wh_Log(L"SCALPEL: Warning - no hotkeys registered by owner thread.");
+    }
+
+    return anyRegistered;
+}
+
+void UnregisterOwnedHotkeysForThread() {
+    for (auto& action : g_settings.hotkeyActions) {
+        if (action.registered) {
+            UnregisterHotKey(nullptr, action.hotkeyId);
             action.registered = false;
         }
     }
 }
 
-void UnregisterCustomHotkeys(HWND hWnd) {
-    for (auto& action : g_settings.hotkeyActions) {
-        if (action.registered) {
-            UnregisterHotKey(hWnd, action.hotkeyId);
-            action.registered = false;
-        }
+DWORD WINAPI HotkeyOwnerThreadProc(LPVOID) {
+    MSG msg;
+    PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE);
+
+    if (!RegisterOwnedHotkeysForThread()) {
+        Wh_Log(L"SCALPEL: Owner thread started with zero registered hotkeys.");
     }
+
+    g_hotkeyOwnerReady = true;
+    if (g_hotkeyOwnerReadyEvent) {
+        SetEvent(g_hotkeyOwnerReadyEvent);
+    }
+
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_HOTKEY) {
+            DispatchHotkeyById(static_cast<int>(msg.wParam));
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    UnregisterOwnedHotkeysForThread();
+    return 0;
+}
+
+bool StartHotkeyOwnerThread() {
+    StopHotkeyOwnerThread();
+
+    g_hotkeyOwnerReady = false;
+    g_hotkeyOwnerReadyEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!g_hotkeyOwnerReadyEvent) {
+        Wh_Log(L"SCALPEL: Failed to create owner-ready event.");
+        return false;
+    }
+
+    g_hotkeyOwnerThread =
+        CreateThread(nullptr, 0, HotkeyOwnerThreadProc, nullptr, 0,
+                     &g_hotkeyOwnerThreadId);
+    if (!g_hotkeyOwnerThread) {
+        CloseHandle(g_hotkeyOwnerReadyEvent);
+        g_hotkeyOwnerReadyEvent = nullptr;
+        g_hotkeyOwnerThreadId = 0;
+        Wh_Log(L"SCALPEL: Failed to create owner thread.");
+        return false;
+    }
+
+    DWORD waitResult = WaitForSingleObject(g_hotkeyOwnerReadyEvent, 2000);
+    CloseHandle(g_hotkeyOwnerReadyEvent);
+    g_hotkeyOwnerReadyEvent = nullptr;
+
+    if (waitResult != WAIT_OBJECT_0 || !g_hotkeyOwnerReady) {
+        Wh_Log(L"SCALPEL: Owner thread startup timed out.");
+        StopHotkeyOwnerThread();
+        return false;
+    }
+
+    Wh_Log(L"SCALPEL: Owner thread started (tid=%u).", g_hotkeyOwnerThreadId);
+    return true;
+}
+
+void StopHotkeyOwnerThread() {
+    if (!g_hotkeyOwnerThread)
+        return;
+
+    if (g_hotkeyOwnerThreadId != 0) {
+        PostThreadMessage(g_hotkeyOwnerThreadId, WM_QUIT, 0, 0);
+    }
+
+    DWORD waitResult =
+        WaitForSingleObject(g_hotkeyOwnerThread, kHotkeyOwnerThreadJoinTimeoutMs);
+    if (waitResult != WAIT_OBJECT_0) {
+        Wh_Log(L"SCALPEL: Owner thread join timed out.");
+    }
+
+    CloseHandle(g_hotkeyOwnerThread);
+    g_hotkeyOwnerThread = nullptr;
+    g_hotkeyOwnerThreadId = 0;
+    g_hotkeyOwnerReady = false;
+    Wh_Log(L"SCALPEL: Owner thread stopped.");
 }
 
 LRESULT CALLBACK TaskbarWindowSubclassProc(HWND hWnd,
@@ -622,35 +749,19 @@ LRESULT CALLBACK TaskbarWindowSubclassProc(HWND hWnd,
                                            WPARAM wParam,
                                            LPARAM lParam,
                                            DWORD_PTR dwRefData) {
-    // Phase C: The Trigger & Action Dispatcher
+    // Compatibility path: shared dispatcher in case fallback ownership is used.
     if (uMsg == WM_HOTKEY) {
-        int hotkeyId = static_cast<int>(wParam);
-        for (const auto& action : g_settings.hotkeyActions) {
-            if (action.registered && action.hotkeyId == hotkeyId) {
-                // Execute Payload
-                if (action.actionType != HotkeyActionType::Nothing &&
-                    action.actionExecutor) {
-                    action.actionExecutor();
-                }
-
-                // Mitigation 2: Start Menu Masking (0xFF)
-                // If the 'Win' key was part of the combination, fire the dummy
-                // 0xFF keystroke to kill Start Menu.
-                if (action.modifiers & MOD_WIN) {
-                    SendKeypressInternal({0xFF});
-                }
-                return 0;
-            }
+        if (DispatchHotkeyById(static_cast<int>(wParam))) {
+            return 0;
         }
     }
 
-    // IPC Lifecycle Management (Thread Affinity Safe)
+    // Keep IPC messages accepted for compatibility; ownership moved to tool
+    // thread so these become no-ops.
     if (uMsg == g_msgRegister) {
-        RegisterCustomHotkeys(hWnd);
         return 0;
     }
     if (uMsg == g_msgUnregister) {
-        UnregisterCustomHotkeys(hWnd);
         return 0;
     }
 
@@ -696,8 +807,6 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
     // (Multi-monitors) to prevent duplicates.
     if (bTextualClassName && _wcsicmp(lpClassName, L"Shell_TrayWnd") == 0) {
         HandleIdentifiedTaskbarWindow(hWnd);
-        SendMessageTimeout(hWnd, g_msgRegister, 0, 0, SMTO_ABORTIFHUNG, 500,
-                           NULL);
     }
 
     return hWnd;
@@ -808,6 +917,7 @@ void LoadSettings() {
         action.actionType = actionType;
         action.additionalArgs = argsStr;
         action.actionExecutor = ParseActionSetting(actionType, argsStr);
+        action.hotkeyId = kHotkeyIdBase + static_cast<int>(i);
         action.registered = false;
 
         if (FromStringHotKey(hotkeyStr, &action.modifiers, &action.vk)) {
@@ -834,6 +944,7 @@ BOOL Wh_ModInit() {
     Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook,
                        (void**)&CreateWindowExW_Original);
 
+    StartHotkeyOwnerThread();
     return TRUE;
 }
 
@@ -841,16 +952,14 @@ void Wh_ModAfterInit() {
     HWND hWnd = FindCurrentProcessTaskbarWindow();
     if (hWnd) {
         HandleIdentifiedTaskbarWindow(hWnd);
-        SendMessageTimeout(g_hTaskbarWnd, g_msgRegister, 0, 0, SMTO_ABORTIFHUNG,
-                           500, NULL);
     }
 }
 
 void Wh_ModUninit() {
+    StopHotkeyOwnerThread();
+
     if (g_hTaskbarWnd) {
         // Clean up IPC Thread safely
-        SendMessageTimeout(g_hTaskbarWnd, g_msgUnregister, 0, 0,
-                           SMTO_ABORTIFHUNG, 500, NULL);
         WindhawkUtils::RemoveWindowSubclassFromAnyThread(
             g_hTaskbarWnd, TaskbarWindowSubclassProc);
     }
@@ -860,17 +969,11 @@ void Wh_ModUninit() {
 }
 
 void Wh_ModSettingsChanged() {
-    if (g_hTaskbarWnd) {
-        SendMessageTimeout(g_hTaskbarWnd, g_msgUnregister, 0, 0,
-                           SMTO_ABORTIFHUNG, 500, NULL);
-    }
+    StopHotkeyOwnerThread();
 
     LoadSettings();
 
-    if (g_hTaskbarWnd) {
-        SendMessageTimeout(g_hTaskbarWnd, g_msgRegister, 0, 0, SMTO_ABORTIFHUNG,
-                           500, NULL);
-    }
+    StartHotkeyOwnerThread();
 
     // Optional: Only prompt if specific protected keys (like Win+Shift+S) were
     // modified. For now, prompt the user so they are aware a restart is needed.
