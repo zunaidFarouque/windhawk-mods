@@ -22,6 +22,9 @@ Snipping Tool).
 4. **Remapping Test:** `Win+Shift+S` set to `ACTION_START_PROCESS` (Overrides
 Snipping tool and launches Paint. Edit the path to launch
 Flameshot/ZeroSnip.bat).
+
+Need more built-in predefined shortcuts (such as media/display/system actions)?
+Open a request at: https://github.com/zunaidFarouque/windhawk-mods
 */
 // ==/WindhawkModReadme==
 
