@@ -27,77 +27,59 @@ Flameshot/ZeroSnip.bat).
 
 // ==WindhawkModSettings==
 /*
-- hotkey0: "Ctrl+Alt+I"
-  $name: "1. Normal Layer Hotkey"
-- action0: "ACTION_START_PROCESS"
-  $name: "1. Normal Layer Action"
-  $options:
-  - ACTION_NOTHING: Block / Do Nothing
-  - ACTION_START_PROCESS: Run Custom App / File / URL
-  - ACTION_VOL_UP: Volume Up
-  - ACTION_VOL_DOWN: Volume Down
-  - ACTION_VOL_MUTE: Toggle Mute
-  - ACTION_MEDIA_PLAY: Media Play / Pause
-  - ACTION_MEDIA_NEXT: Next Track
-  - ACTION_MEDIA_PREV: Previous Track
-  - ACTION_BRIGHTNESS_UP: Brightness Up
-  - ACTION_BRIGHTNESS_DOWN: Brightness Down
-  - ACTION_SLEEP_DISPLAY: Sleep Display
-  - ACTION_LOCK_PC: Lock PC
-  - ACTION_SHOW_DESKTOP: Show Desktop
-  - ACTION_TASK_MANAGER: Open Task Manager
-  - ACTION_VD_NEXT: Next Virtual Desktop
-  - ACTION_VD_PREV: Previous Virtual Desktop
-- args0: "notepad.exe"
-  $name: "1. Normal Layer Args"
-
-- hotkey1: "Win+W"
-  $name: "2. Upper Layer Hotkey"
-- action1: "ACTION_START_PROCESS"
-  $name: "2. Upper Layer Action"
-  $options:
-  - ACTION_NOTHING: Block / Do Nothing
-  - ACTION_START_PROCESS: Run Custom App / File / URL
-  - ACTION_VOL_UP: Volume Up
-  - ACTION_VOL_DOWN: Volume Down
-  - ACTION_VOL_MUTE: Toggle Mute
-  - ACTION_MEDIA_PLAY: Media Play / Pause
-  - ACTION_MEDIA_NEXT: Next Track
-  - ACTION_MEDIA_PREV: Previous Track
-  - ACTION_BRIGHTNESS_UP: Brightness Up
-  - ACTION_BRIGHTNESS_DOWN: Brightness Down
-  - ACTION_SLEEP_DISPLAY: Sleep Display
-  - ACTION_LOCK_PC: Lock PC
-  - ACTION_SHOW_DESKTOP: Show Desktop
-  - ACTION_TASK_MANAGER: Open Task Manager
-  - ACTION_VD_NEXT: Next Virtual Desktop
-  - ACTION_VD_PREV: Previous Virtual Desktop
-- args1: "calc.exe"
-  $name: "2. Upper Layer Args"
-
-- hotkey2: "Win+Shift+S"
-  $name: "3. Target OS Hotkey (Win+Shift+S)"
-- action2: "ACTION_START_PROCESS"
-  $name: "3. Target Action (Change to ACTION_NOTHING to test pure block)"
-  $options:
-  - ACTION_NOTHING: Block / Do Nothing
-  - ACTION_START_PROCESS: Run Custom App / File / URL
-  - ACTION_VOL_UP: Volume Up
-  - ACTION_VOL_DOWN: Volume Down
-  - ACTION_VOL_MUTE: Toggle Mute
-  - ACTION_MEDIA_PLAY: Media Play / Pause
-  - ACTION_MEDIA_NEXT: Next Track
-  - ACTION_MEDIA_PREV: Previous Track
-  - ACTION_BRIGHTNESS_UP: Brightness Up
-  - ACTION_BRIGHTNESS_DOWN: Brightness Down
-  - ACTION_SLEEP_DISPLAY: Sleep Display
-  - ACTION_LOCK_PC: Lock PC
-  - ACTION_SHOW_DESKTOP: Show Desktop
-  - ACTION_TASK_MANAGER: Open Task Manager
-  - ACTION_VD_NEXT: Next Virtual Desktop
-  - ACTION_VD_PREV: Previous Virtual Desktop
-- args2: "mspaint.exe"
-  $name: "3. Target Args"
+- HotkeyActions:
+  - - Hotkey: "Ctrl+Alt+I"
+      $name: Hotkey
+      $description: "Hotkey (e.g., Win+Shift+S)"
+    - Action: "ACTION_START_PROCESS"
+      $name: Action to Perform
+      $options:
+      - ACTION_NOTHING: Block / Do Nothing
+      - ACTION_START_PROCESS: Run Custom App / File / URL
+      - ACTION_VOL_UP: Volume Up
+      - ACTION_VOL_DOWN: Volume Down
+      - ACTION_VOL_MUTE: Toggle Mute
+      - ACTION_MEDIA_PLAY: Media Play / Pause
+      - ACTION_MEDIA_NEXT: Next Track
+      - ACTION_MEDIA_PREV: Previous Track
+      - ACTION_BRIGHTNESS_UP: Brightness Up
+      - ACTION_BRIGHTNESS_DOWN: Brightness Down
+      - ACTION_SLEEP_DISPLAY: Sleep Display
+      - ACTION_LOCK_PC: Lock PC
+      - ACTION_SHOW_DESKTOP: Show Desktop
+      - ACTION_TASK_MANAGER: Open Task Manager
+      - ACTION_VD_NEXT: Next Virtual Desktop
+      - ACTION_VD_PREV: Previous Virtual Desktop
+    - Args: "notepad.exe"
+      $name: Target Path / Arguments
+      $description: "Only used if Action is 'Run Custom App'. Enter your .exe, .bat, or URL here."
+  - - Hotkey: "Win+Shift+S"
+      $name: Hotkey
+      $description: "Hotkey (e.g., Win+Shift+S)"
+    - Action: "ACTION_START_PROCESS"
+      $name: Action to Perform
+      $options:
+      - ACTION_NOTHING: Block / Do Nothing
+      - ACTION_START_PROCESS: Run Custom App / File / URL
+      - ACTION_VOL_UP: Volume Up
+      - ACTION_VOL_DOWN: Volume Down
+      - ACTION_VOL_MUTE: Toggle Mute
+      - ACTION_MEDIA_PLAY: Media Play / Pause
+      - ACTION_MEDIA_NEXT: Next Track
+      - ACTION_MEDIA_PREV: Previous Track
+      - ACTION_BRIGHTNESS_UP: Brightness Up
+      - ACTION_BRIGHTNESS_DOWN: Brightness Down
+      - ACTION_SLEEP_DISPLAY: Sleep Display
+      - ACTION_LOCK_PC: Lock PC
+      - ACTION_SHOW_DESKTOP: Show Desktop
+      - ACTION_TASK_MANAGER: Open Task Manager
+      - ACTION_VD_NEXT: Next Virtual Desktop
+      - ACTION_VD_PREV: Previous Virtual Desktop
+    - Args: "mspaint.exe"
+      $name: Target Path / Arguments
+      $description: "Only used if Action is 'Run Custom App'. Enter your .exe, .bat, or URL here."
+  $name: "Hotkey Configurations"
+  $description: "Add, remove, or modify your custom hotkey overrides."
 */
 // ==/WindhawkModSettings==
 
@@ -681,17 +663,18 @@ std::wstring GetStringSettingSafe(PCWSTR name) {
 void LoadSettings() {
     g_settings.hotkeyActions.clear();
 
-    for (int i = 0; i < 3; i++) {
-        std::wstring hotkeyKey = L"hotkey" + std::to_wstring(i);
-        std::wstring actionKey = L"action" + std::to_wstring(i);
-        std::wstring argsKey = L"args" + std::to_wstring(i);
+    for (int i = 0; i < 50; i++) {
+        std::wstring baseKey = L"HotkeyActions[" + std::to_wstring(i) + L"]";
+        std::wstring hotkeyKey = baseKey + L".Hotkey";
+        std::wstring actionKey = baseKey + L".Action";
+        std::wstring argsKey = baseKey + L".Args";
 
         std::wstring hotkeyStr = GetStringSettingSafe(hotkeyKey.c_str());
         std::wstring actionStr = GetStringSettingSafe(actionKey.c_str());
         std::wstring argsStr = GetStringSettingSafe(argsKey.c_str());
 
         if (hotkeyStr.empty())
-            continue;
+            break;
 
         HotkeyActionType actionType = ParseActionType(actionStr);
         HotkeyAction action;
