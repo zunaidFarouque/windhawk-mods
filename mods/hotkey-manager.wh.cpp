@@ -6,6 +6,7 @@
 // @author          vfxturjo
 // @github          https://github.com/zunaidFarouque
 // @include         explorer.exe
+// @include         windhawk.exe
 // @compilerOptions -lcomctl32 -loleaut32 -lole32 -lversion
 // ==/WindhawkMod==
 
@@ -159,6 +160,9 @@ static HANDLE g_hotkeyOwnerThread = nullptr;
 static DWORD g_hotkeyOwnerThreadId = 0;
 static HANDLE g_hotkeyOwnerReadyEvent = nullptr;
 static bool g_hotkeyOwnerReady = false;
+static bool g_isToolModProcessLauncher = false;
+static bool g_isCurrentToolModProcess = false;
+static HANDLE g_toolModProcessMutex = nullptr;
 
 // Cross-thread IPC Messages (Anti-Deadlock)
 static UINT g_msgRegister = RegisterWindowMessage(L"Scalpel_Register");
@@ -177,6 +181,18 @@ static void UnregisterOwnedHotkeysForThread();
 static DWORD WINAPI HotkeyOwnerThreadProc(LPVOID);
 static bool StartHotkeyOwnerThread();
 static void StopHotkeyOwnerThread();
+static BOOL InitExplorerLane();
+static void ExplorerLaneAfterInit();
+static void ExplorerLaneSettingsChanged();
+static void ExplorerLaneUninit();
+static bool IsCurrentProcessWindhawk();
+static bool DetermineToolProcessRole();
+static BOOL StartToolModProcessIfLauncher();
+static BOOL WhTool_ModInit();
+static void WhTool_ModSettingsChanged();
+static void WhTool_ModUninit();
+static void LoadSettings();
+static void WINAPI EntryPoint_Hook();
 
 // =====================================================================
 // String & Hotkey Parsing (Lifted from m417z)
@@ -621,22 +637,22 @@ bool DispatchHotkeyById(int hotkeyId) {
 }
 
 bool RegisterOwnedHotkeysForThread() {
-    if (!RegisterHotKey_Original) {
-        Wh_Log(L"SCALPEL: RegisterHotKey_Original unavailable.");
-        return false;
-    }
+    auto registerHotKeyFn =
+        RegisterHotKey_Original ? RegisterHotKey_Original : RegisterHotKey;
 
     bool anyRegistered = false;
+    int registeredCount = 0;
     for (auto& action : g_settings.hotkeyActions) {
         if (action.hotkeyString.empty())
             continue;
 
         // Thread-owned global hotkey (hWnd = nullptr) dispatches WM_HOTKEY to
         // the owner's message queue.
-        if (RegisterHotKey_Original(nullptr, action.hotkeyId, action.modifiers,
-                                    action.vk)) {
+        if (registerHotKeyFn(nullptr, action.hotkeyId, action.modifiers,
+                             action.vk)) {
             action.registered = true;
             anyRegistered = true;
+            registeredCount++;
             Wh_Log(L"SCALPEL: Owner thread registered %s (id=%d).",
                    action.hotkeyString.c_str(), action.hotkeyId);
         } else {
@@ -648,6 +664,8 @@ bool RegisterOwnedHotkeysForThread() {
 
     if (!anyRegistered && !g_settings.hotkeyActions.empty()) {
         Wh_Log(L"SCALPEL: Warning - no hotkeys registered by owner thread.");
+    } else {
+        Wh_Log(L"SCALPEL: Owner thread registered count=%d.", registeredCount);
     }
 
     return anyRegistered;
@@ -886,6 +904,167 @@ void PromptForExplorerRestart() {
 // Windhawk Lifecycle & Export Methods
 // =====================================================================
 
+bool IsCurrentProcessWindhawk() {
+    WCHAR currentProcessPath[MAX_PATH];
+    if (!GetModuleFileName(nullptr, currentProcessPath,
+                           ARRAYSIZE(currentProcessPath))) {
+        return false;
+    }
+
+    PCWSTR baseName = wcsrchr(currentProcessPath, L'\\');
+    baseName = baseName ? baseName + 1 : currentProcessPath;
+    return _wcsicmp(baseName, L"windhawk.exe") == 0;
+}
+
+void WINAPI EntryPoint_Hook() {
+    // Tool-mod process should only run this mod logic, then idle in its own
+    // hotkey thread/message loop. Prevent normal windhawk.exe flow in this
+    // spawned process instance.
+    ExitThread(0);
+}
+
+bool DetermineToolProcessRole() {
+    g_isToolModProcessLauncher = false;
+    g_isCurrentToolModProcess = false;
+
+    if (!IsCurrentProcessWindhawk()) {
+        return false;
+    }
+
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
+    if (!argv) {
+        return false;
+    }
+
+    bool isExcluded = false;
+    for (int i = 1; i < argc; i++) {
+        if (wcscmp(argv[i], L"-service") == 0 ||
+            wcscmp(argv[i], L"-service-start") == 0 ||
+            wcscmp(argv[i], L"-service-stop") == 0) {
+            isExcluded = true;
+            break;
+        }
+    }
+
+    bool isToolModProcess = false;
+    for (int i = 1; !isExcluded && i < argc - 1; i++) {
+        if (wcscmp(argv[i], L"-tool-mod") == 0) {
+            isToolModProcess = true;
+            if (wcscmp(argv[i + 1], WH_MOD_ID) == 0) {
+                g_isCurrentToolModProcess = true;
+            }
+            break;
+        }
+    }
+
+    LocalFree(argv);
+
+    if (isExcluded) {
+        return false;
+    }
+
+    if (!isToolModProcess) {
+        g_isToolModProcessLauncher = true;
+    }
+
+    return true;
+}
+
+BOOL StartToolModProcessIfLauncher() {
+    if (!g_isToolModProcessLauncher) {
+        return TRUE;
+    }
+
+    WCHAR currentProcessPath[MAX_PATH];
+    switch (GetModuleFileName(nullptr, currentProcessPath,
+                              ARRAYSIZE(currentProcessPath))) {
+        case 0:
+        case ARRAYSIZE(currentProcessPath):
+            Wh_Log(L"SCALPEL: GetModuleFileName failed for tool launcher.");
+            return FALSE;
+    }
+
+    WCHAR commandLine[MAX_PATH + 2 +
+                      (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") /
+                       sizeof(WCHAR)) -
+                      1];
+    swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", currentProcessPath,
+               WH_MOD_ID);
+
+    HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
+    if (!kernelModule) {
+        kernelModule = GetModuleHandle(L"kernel32.dll");
+        if (!kernelModule) {
+            Wh_Log(L"SCALPEL: Missing kernelbase/kernel32.");
+            return FALSE;
+        }
+    }
+
+    using CreateProcessInternalW_t = BOOL(WINAPI*)(
+        HANDLE hUserToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
+        LPSECURITY_ATTRIBUTES lpProcessAttributes,
+        LPSECURITY_ATTRIBUTES lpThreadAttributes, WINBOOL bInheritHandles,
+        DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
+        LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation,
+        PHANDLE hRestrictedUserToken);
+    CreateProcessInternalW_t pCreateProcessInternalW =
+        (CreateProcessInternalW_t)GetProcAddress(kernelModule,
+                                                 "CreateProcessInternalW");
+    if (!pCreateProcessInternalW) {
+        Wh_Log(L"SCALPEL: CreateProcessInternalW unavailable.");
+        return FALSE;
+    }
+
+    STARTUPINFO si{
+        .cb = sizeof(STARTUPINFO),
+        .dwFlags = STARTF_FORCEOFFFEEDBACK,
+    };
+    PROCESS_INFORMATION pi = {};
+    if (!pCreateProcessInternalW(nullptr, currentProcessPath, commandLine,
+                                 nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS,
+                                 nullptr, nullptr, &si, &pi, nullptr)) {
+        Wh_Log(L"SCALPEL: Failed to spawn tool-mod process.");
+        return FALSE;
+    }
+
+    Wh_Log(L"SCALPEL: Spawned tool-mod process pid=%u.", pi.dwProcessId);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return TRUE;
+}
+
+BOOL WhTool_ModInit() {
+    g_toolModProcessMutex =
+        CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
+    if (!g_toolModProcessMutex) {
+        Wh_Log(L"SCALPEL: CreateMutex failed in tool-mod process.");
+        return FALSE;
+    }
+
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        Wh_Log(L"SCALPEL: Tool-mod process already running.");
+        return FALSE;
+    }
+
+    LoadSettings();
+    return StartHotkeyOwnerThread() ? TRUE : FALSE;
+}
+
+void WhTool_ModSettingsChanged() {
+    StopHotkeyOwnerThread();
+    LoadSettings();
+    StartHotkeyOwnerThread();
+}
+
+void WhTool_ModUninit() {
+    StopHotkeyOwnerThread();
+    if (g_toolModProcessMutex) {
+        CloseHandle(g_toolModProcessMutex);
+        g_toolModProcessMutex = nullptr;
+    }
+}
+
 std::wstring GetStringSettingSafe(PCWSTR name) {
     PCWSTR val = Wh_GetStringSetting(name);
     if (!val)
@@ -926,7 +1105,7 @@ void LoadSettings() {
     }
 }
 
-BOOL Wh_ModInit() {
+BOOL InitExplorerLane() {
     LoadSettings();
 
     // Setup Phase A Intercept Hook
@@ -944,20 +1123,17 @@ BOOL Wh_ModInit() {
     Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook,
                        (void**)&CreateWindowExW_Original);
 
-    StartHotkeyOwnerThread();
     return TRUE;
 }
 
-void Wh_ModAfterInit() {
+void ExplorerLaneAfterInit() {
     HWND hWnd = FindCurrentProcessTaskbarWindow();
     if (hWnd) {
         HandleIdentifiedTaskbarWindow(hWnd);
     }
 }
 
-void Wh_ModUninit() {
-    StopHotkeyOwnerThread();
-
+void ExplorerLaneUninit() {
     if (g_hTaskbarWnd) {
         // Clean up IPC Thread safely
         WindhawkUtils::RemoveWindowSubclassFromAnyThread(
@@ -968,14 +1144,89 @@ void Wh_ModUninit() {
 
 }
 
-void Wh_ModSettingsChanged() {
-    StopHotkeyOwnerThread();
-
+void ExplorerLaneSettingsChanged() {
     LoadSettings();
-
-    StartHotkeyOwnerThread();
 
     // Optional: Only prompt if specific protected keys (like Win+Shift+S) were
     // modified. For now, prompt the user so they are aware a restart is needed.
     PromptForExplorerRestart();
+}
+
+BOOL Wh_ModInit() {
+    bool isWindhawkRole = DetermineToolProcessRole();
+    if (isWindhawkRole) {
+        if (g_isCurrentToolModProcess) {
+            Wh_Log(L"SCALPEL: Role=current tool-mod process.");
+            if (!WhTool_ModInit()) {
+                ExitProcess(1);
+            }
+
+            IMAGE_DOS_HEADER* dosHeader =
+                (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
+            IMAGE_NT_HEADERS* ntHeaders =
+                (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
+            DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+            void* entryPoint = (BYTE*)dosHeader + entryPointRVA;
+
+            Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
+            return TRUE;
+        }
+
+        if (g_isToolModProcessLauncher) {
+            Wh_Log(L"SCALPEL: Role=tool-mod launcher process.");
+            return TRUE;
+        }
+
+        // This is a tool-mod process for a different mod ID. Skip.
+        Wh_Log(L"SCALPEL: Role=non-current tool-mod process, skipping.");
+        return FALSE;
+    }
+
+    Wh_Log(L"SCALPEL: Role=explorer lane.");
+    return InitExplorerLane();
+}
+
+void Wh_ModAfterInit() {
+    if (g_isCurrentToolModProcess) {
+        Wh_Log(L"SCALPEL: Wh_ModAfterInit skipped in current tool-mod process.");
+        return;
+    }
+
+    if (g_isToolModProcessLauncher) {
+        Wh_Log(L"SCALPEL: Wh_ModAfterInit launching tool-mod process.");
+        StartToolModProcessIfLauncher();
+        return;
+    }
+
+    ExplorerLaneAfterInit();
+}
+
+void Wh_ModSettingsChanged() {
+    if (g_isCurrentToolModProcess) {
+        Wh_Log(L"SCALPEL: Settings changed in tool-mod process.");
+        WhTool_ModSettingsChanged();
+        return;
+    }
+
+    if (g_isToolModProcessLauncher) {
+        Wh_Log(L"SCALPEL: Settings changed in launcher process (no-op).");
+        return;
+    }
+
+    ExplorerLaneSettingsChanged();
+}
+
+void Wh_ModUninit() {
+    if (g_isCurrentToolModProcess) {
+        Wh_Log(L"SCALPEL: Uninit current tool-mod process.");
+        WhTool_ModUninit();
+        ExitProcess(0);
+    }
+
+    if (g_isToolModProcessLauncher) {
+        Wh_Log(L"SCALPEL: Uninit launcher process (no-op).");
+        return;
+    }
+
+    ExplorerLaneUninit();
 }
