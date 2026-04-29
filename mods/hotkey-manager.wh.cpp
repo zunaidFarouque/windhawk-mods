@@ -3,7 +3,8 @@
 // @name            Scalpel Hotkey Manager (v3.0 Architecture)
 // @description     Zero-latency interception and remapping of protected Windows OS hotkeys (Win+Shift+S).
 // @version         1.0.1
-// @author          You & Gemini
+// @author          vfxturjo
+// @github          https://github.com/zunaidFarouque
 // @include         explorer.exe
 // @compilerOptions -lcomctl32 -loleaut32 -lole32 -lversion
 // ==/WindhawkMod==
